@@ -1,0 +1,14 @@
+backend/node_modules/
+frontend/node_modules/
+.env
+.env.*
+!.env.example
+backend/.env
+backend/.env.*
+frontend/.angular/
+frontend/dist/
+downloads/
+__pycache__/
+*.py[cod]
+.venv/
+venv/

@@ -1,0 +1,162 @@
+<main class="min-h-screen bg-slate-950 px-4 py-10 text-slate-100 sm:px-8">
+  <div class="mx-auto max-w-4xl">
+    <header class="mb-12">
+      <p class="mb-3 text-sm font-semibold uppercase tracking-[0.25em] text-cyan-400">
+        Niche Video Finder
+      </p>
+      <h1 class="text-4xl font-bold tracking-tight sm:text-5xl">Trova video per la tua nicchia</h1>
+      <p class="mt-4 max-w-2xl text-lg text-slate-300">
+        Cerca su YouTube e scarica solo i risultati con licenza Creative Commons Attribution
+        esplicitamente indicata.
+      </p>
+    </header>
+
+    <form
+      class="grid gap-5 rounded-2xl border border-slate-800 bg-slate-900 p-6 shadow-xl sm:grid-cols-[1fr_auto] sm:items-end"
+      (ngSubmit)="download()"
+    >
+      <label class="block">
+        <span class="mb-2 block text-sm font-medium text-slate-200">Parole chiave</span>
+        <input
+          class="w-full rounded-lg border border-slate-700 bg-slate-950 px-4 py-3 text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan-400 focus:ring-2 focus:ring-cyan-400/20"
+          type="text"
+          name="keyword"
+          [(ngModel)]="keyword"
+          minlength="2"
+          maxlength="120"
+          placeholder="es. coltivazione urbana"
+          required
+        />
+      </label>
+
+      <button
+        class="rounded-lg bg-cyan-400 px-5 py-3 font-semibold text-slate-950 transition hover:bg-cyan-300 disabled:cursor-not-allowed disabled:opacity-60"
+        type="submit"
+        [disabled]="loading() || !rightsConfirmed || brief.trim().length < 5"
+      >
+        {{ loading() ? 'Ricerca, download e montaggio…' : 'Cerca, scarica e crea Short' }}
+      </button>
+    </form>
+
+    <p class="mt-4 text-sm text-slate-400">
+      I download sono salvati nella cartella <code class="text-cyan-300">downloads/</code>.
+      Verifica sempre licenze e obblighi di attribuzione.
+    </p>
+
+    <section class="mt-6 grid gap-4 rounded-2xl border border-slate-800 bg-slate-900 p-5">
+      <label class="block">
+        <span class="mb-2 block text-sm font-medium text-slate-200">Spunto per la narrazione</span>
+        <textarea
+          class="min-h-24 w-full rounded-lg border border-slate-700 bg-slate-950 px-4 py-3 text-slate-100 outline-none focus:border-cyan-400"
+          [(ngModel)]="brief"
+          [ngModelOptions]="{ standalone: true }"
+          maxlength="400"
+        ></textarea>
+      </label>
+      <label class="flex items-start gap-3 text-sm text-slate-300">
+        <input
+          class="mt-1 accent-cyan-400"
+          type="checkbox"
+          [(ngModel)]="rightsConfirmed"
+          [ngModelOptions]="{ standalone: true }"
+        />
+        <span>Confermo di avere i diritti necessari per modificare e riutilizzare il video.</span>
+      </label>
+    </section>
+
+    @if (error()) {
+      <p class="mt-8 rounded-xl border border-rose-900 bg-rose-950/60 p-4 text-rose-200" role="alert">
+        {{ error() }}
+      </p>
+    }
+
+    @if (pipelineJob(); as job) {
+      <section class="mt-10 rounded-2xl border border-slate-800 bg-slate-900 p-6" aria-live="polite">
+        <div class="flex items-center justify-between gap-4">
+          <div>
+            <h2 class="text-xl font-semibold">Elaborazione automatica</h2>
+            <p class="mt-1 text-sm text-slate-400">Nicchia: {{ job.keyword }}</p>
+          </div>
+          <span class="shrink-0 text-cyan-300">{{ job.progress }}%</span>
+        </div>
+        <p class="mt-4 text-sm text-slate-200">{{ job.message }}</p>
+        <div class="mt-2 h-2 overflow-hidden rounded-full bg-slate-800">
+          <div
+            class="h-full rounded-full bg-cyan-400 transition-all"
+            [style.width.%]="job.progress"
+          ></div>
+        </div>
+        <ol class="mt-5 grid gap-2 text-sm sm:grid-cols-2">
+          @for (stage of job.stages; track stage.name) {
+            <li
+              class="flex items-center gap-2"
+              [class.text-cyan-300]="stage.status === 'running'"
+              [class.text-emerald-300]="stage.status === 'completed'"
+              [class.text-rose-300]="stage.status === 'failed'"
+              [class.text-slate-500]="stage.status === 'pending'"
+            >
+              <span aria-hidden="true">
+                {{ stage.status === 'completed' ? '✓' : stage.status === 'running' ? '…' : '·' }}
+              </span>
+              <span>
+                {{ stageLabels[stage.name] }}
+                @if (stage.status === 'running' && stage.name === 'download') {
+                  · {{ stage.progress }}%
+                }
+              </span>
+            </li>
+          }
+        </ol>
+
+        @if (job.video) {
+          <div class="mt-6 border-t border-slate-800 pt-5">
+            <h3 class="font-semibold">{{ job.video.title }}</h3>
+            <p class="mt-1 text-xs text-slate-400">{{ job.video.license }}</p>
+            <a
+              class="mt-2 inline-block text-sm text-cyan-300 underline underline-offset-4"
+              [href]="job.video.url"
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              Apri il video originale
+            </a>
+            <video
+              class="mt-4 aspect-video w-full rounded-lg bg-black"
+              [src]="job.video.source_preview_url"
+              controls
+              playsinline
+              preload="metadata"
+            >
+              Il browser non supporta la riproduzione video.
+            </video>
+          </div>
+        }
+
+        @if (job.status === 'completed' && job.result) {
+          <div class="mt-6 border-t border-slate-800 pt-5">
+            <p class="text-sm text-slate-400">Scena analizzata: {{ job.result.scene_summary }}</p>
+            <p class="mt-2 text-slate-200">{{ job.result.script }}</p>
+            <video
+              class="mt-4 aspect-[9/16] max-h-[70vh] w-auto rounded-lg bg-black"
+              [src]="job.result.preview_url"
+              controls
+              playsinline
+              preload="metadata"
+            >
+              Il browser non supporta la riproduzione video.
+            </video>
+            <a
+              class="mt-4 inline-flex rounded-lg bg-cyan-400 px-4 py-2 text-sm font-semibold text-slate-950 hover:bg-cyan-300"
+              [href]="job.result.download_url"
+            >
+              Scarica Short 9:16
+            </a>
+          </div>
+        }
+        @if (job.status === 'failed') {
+          <p class="mt-4 text-sm text-rose-300" role="alert">{{ job.error || job.message }}</p>
+        }
+      </section>
+    }
+  </div>
+</main>
