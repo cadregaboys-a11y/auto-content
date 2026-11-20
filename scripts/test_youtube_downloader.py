@@ -1,3 +1,5 @@
+import io
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -5,13 +7,57 @@ from unittest.mock import patch
 
 import youtube_downloader
 from youtube_downloader import (
+    _candidate_match_filter,
     _candidate_is_eligible,
     _candidate_priority,
+    _select_candidates,
     has_allowed_license,
 )
 
 
 class AllowedLicenseTests(unittest.TestCase):
+    def test_main_reconfigures_streams_before_printing_unicode_json(self) -> None:
+        class ReconfigurableStringIO(io.StringIO):
+            def reconfigure(self, **settings):
+                self.encoding_settings = settings
+
+        stdout = ReconfigurableStringIO()
+        stderr = ReconfigurableStringIO()
+        with (
+            patch.object(
+                youtube_downloader.sys,
+                "argv",
+                ["youtube_downloader.py", "--keyword", "ceramica"],
+            ),
+            patch.object(youtube_downloader.sys, "stdout", stdout),
+            patch.object(youtube_downloader.sys, "stderr", stderr),
+            patch.object(
+                youtube_downloader,
+                "download_matches",
+                return_value=[
+                    {
+                        "id": "video12345",
+                        "title": "Una tazza 🎬",
+                        "url": "https://youtube.com/watch?v=video12345",
+                        "license": "None",
+                        "file": "video12345.mp4",
+                    }
+                ],
+            ),
+        ):
+            result_code = youtube_downloader.main()
+
+        self.assertEqual(result_code, 0)
+        self.assertEqual(stdout.encoding_settings, {
+            "encoding": "utf-8",
+            "errors": "backslashreplace",
+        })
+        self.assertEqual(stderr.encoding_settings, {
+            "encoding": "utf-8",
+            "errors": "backslashreplace",
+        })
+        self.assertEqual(json.loads(stdout.getvalue())["videos"][0]["title"], "Una tazza 🎬")
+
     def test_accepts_youtube_creative_commons_attribution_license(self) -> None:
         self.assertTrue(
             has_allowed_license("Creative Commons Attribution license (reuse allowed)")
@@ -70,6 +116,86 @@ class AllowedLicenseTests(unittest.TestCase):
             _candidate_priority(ideal_landscape),
             _candidate_priority(ideal_unknown_orientation),
         )
+
+    def test_candidate_filter_bypasses_license_and_duration_checks(self) -> None:
+        self.assertIsNone(
+            _candidate_match_filter(
+                {
+                    "webpage_url": "https://youtube.com/watch?v=video12345",
+                    "duration": 1200,
+                    "license": None,
+                },
+                incomplete=False,
+            )
+        )
+
+    def test_selection_falls_back_to_the_shortest_horizontal_video_over_15_minutes(self) -> None:
+        candidates = [
+            {
+                "webpage_url": "https://youtube.com/watch?v=huge12345",
+                "duration": 7200,
+                "width": 1920,
+                "height": 1080,
+            },
+            {
+                "webpage_url": "https://youtube.com/watch?v=shortest1",
+                "duration": 1200,
+                "width": 1920,
+                "height": 1080,
+            },
+            {
+                "webpage_url": "https://youtube.com/watch?v=portrait1",
+                "duration": 420,
+                "width": 720,
+                "height": 1280,
+            },
+        ]
+
+        selected = _select_candidates(candidates, 1)
+
+        self.assertEqual(selected, [candidates[1]])
+
+    def test_selection_uses_one_to_fifteen_minute_videos_before_longer_videos(self) -> None:
+        within_limit = {
+            "webpage_url": "https://youtube.com/watch?v=within12",
+            "duration": 720,
+            "width": 1920,
+            "height": 1080,
+        }
+        too_long = {
+            "webpage_url": "https://youtube.com/watch?v=over900",
+            "duration": 1200,
+            "width": 1920,
+            "height": 1080,
+        }
+
+        selected = _select_candidates([too_long, within_limit], 1)
+
+        self.assertEqual(selected, [within_limit])
+
+    def test_selection_uses_first_non_shorts_result_as_last_resort(self) -> None:
+        candidates = [
+            {
+                "webpage_url": "https://youtube.com/shorts/shorts123",
+                "duration": 45,
+            },
+            {
+                "webpage_url": "https://youtube.com/watch?v=portrait1",
+                "duration": 420,
+                "width": 720,
+                "height": 1280,
+            },
+            {
+                "webpage_url": "https://youtube.com/watch?v=portrait2",
+                "duration": 600,
+                "width": 720,
+                "height": 1280,
+            },
+        ]
+
+        selected = _select_candidates(candidates, 1)
+
+        self.assertEqual(selected, [candidates[1]])
 
     def test_search_verifies_full_metadata_and_reports_download_progress(self) -> None:
         class FakeYouTubeDL:

@@ -62,8 +62,9 @@ def render_vertical_short(
     concatenated = "".join(f"[clip{index}]" for index in range(len(clips)))
     filters.append(
         f"{concatenated}concat=n={len(clips)}:v=1:a=0[video];"
-        "[video]subtitles=captions.ass:"
-        "force_style='FontName=Arial,FontSize=62,Alignment=2,MarginV=170'[output]"
+        # "[video]subtitles=captions.ass:"
+        # "force_style='FontName=Arial,FontSize=62,Alignment=2,MarginV=170'[output]"
+        "[video]subtitles=captions.ass[output]"
     )
     filter_graph = ";".join(filters)
 

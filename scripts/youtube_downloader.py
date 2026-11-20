@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Search YouTube and download only results explicitly marked CC BY."""
+# """Search YouTube and download only results explicitly marked CC BY."""
+"""Search and download YouTube results with cascading candidate fallbacks."""
 
 import argparse
 import json
@@ -23,11 +24,7 @@ IDEAL_SOURCE_VIDEO_DURATION_MAX_SECONDS = 600
 
 def has_allowed_license(license_name: str | None) -> bool:
     """Return whether metadata explicitly identifies YouTube's CC BY license."""
-    # return True
-    #return bool(
-    #    license_name
-    #    and license_name.casefold().startswith("creative commons attribution license")
-    #)
+    #return True
     return bool(
         license_name
         and license_name.casefold().startswith("creative commons attribution license")
@@ -91,6 +88,11 @@ def _candidate_is_eligible(
     return width is None or height is None or height <= width
 
 
+def _is_horizontal(metadata: dict[str, Any]) -> bool:
+    width, height = _video_dimensions(metadata)
+    return width is not None and height is not None and width > height
+
+
 def _candidate_priority(metadata: dict[str, Any]) -> tuple[int, int, int, float]:
     duration = _positive_number(metadata.get("duration")) or 0
     width, height = _video_dimensions(metadata)
@@ -108,6 +110,62 @@ def _candidate_priority(metadata: dict[str, Any]) -> tuple[int, int, int, float]
     )
 
 
+def _select_candidates(
+    candidates: list[dict[str, Any]],
+    limit: int,
+) -> list[dict[str, Any]]:
+    non_shorts = [
+        candidate
+        for candidate in candidates
+        if not _is_shorts_url(str(candidate.get("webpage_url", "")))
+    ]
+    horizontal = [
+        candidate for candidate in non_shorts if _is_horizontal(candidate)
+    ]
+
+    ideal_duration = [
+        candidate
+        for candidate in horizontal
+        if IDEAL_SOURCE_VIDEO_DURATION_MIN_SECONDS
+        <= (_positive_number(candidate.get("duration")) or 0)
+        <= IDEAL_SOURCE_VIDEO_DURATION_MAX_SECONDS
+    ]
+    if ideal_duration:
+        return sorted(
+            ideal_duration,
+            key=_candidate_priority,
+            reverse=True,
+        )[:limit]
+
+    standard_duration = [
+        candidate
+        for candidate in horizontal
+        if MIN_SOURCE_VIDEO_DURATION_SECONDS
+        <= (_positive_number(candidate.get("duration")) or 0)
+        <= MAX_SOURCE_VIDEO_DURATION_SECONDS
+    ]
+    if standard_duration:
+        return sorted(
+            standard_duration,
+            key=_candidate_priority,
+            reverse=True,
+        )[:limit]
+
+    longer_videos = [
+        candidate
+        for candidate in horizontal
+        if (_positive_number(candidate.get("duration")) or 0)
+        > MAX_SOURCE_VIDEO_DURATION_SECONDS
+    ]
+    if longer_videos:
+        return sorted(
+            longer_videos,
+            key=lambda candidate: _positive_number(candidate.get("duration")) or 0,
+        )[:limit]
+
+    return non_shorts[:limit]
+
+
 def _candidate_match_filter(
     info: dict[str, Any],
     *,
@@ -115,10 +173,12 @@ def _candidate_match_filter(
 ) -> str | None:
     if incomplete:
         return None
-    if not has_allowed_license(info.get("license")):
-        return "Licenza Creative Commons Attribution non verificata"
-    if not _candidate_is_eligible(info):
-        return "Durata o orientamento del video non idonei"
+    # if not has_allowed_license(info.get("license")):
+    #     return "Licenza Creative Commons Attribution non verificata"
+    # if not _candidate_is_eligible(info):
+    #     return "Durata o orientamento del video non idonei"
+    if _is_shorts_url(str(info.get("webpage_url", ""))):
+        return "I video Shorts non sono candidati validi"
     return None
 
 
@@ -127,7 +187,8 @@ def download_matches(
     limit: int,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> list[dict[str, str]]:
-    search_limit = min(limit * 5, 25)
+    # search_limit = min(limit * 5, 25)
+    search_limit = min(max(limit * 20, 50), 100)
     search_options: dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
@@ -154,19 +215,25 @@ def download_matches(
     candidates: list[dict[str, Any]] = []
     with yt_dlp.YoutubeDL(search_options) as searcher:
         for index, entry in enumerate(entries):
-            if not entry or not entry.get("webpage_url"):
+            # if not entry or not entry.get("webpage_url"):
+            if not isinstance(entry, dict):
                 continue
-            entry_url = str(entry["webpage_url"])
-            if _is_shorts_url(entry_url):
+            entry_url = str(entry.get("webpage_url") or entry.get("url") or "")
+            if not entry_url:
+                continue
+            if _is_shorts_url(entry_url) or _is_shorts_url(str(entry.get("url", ""))):
                 continue
             metadata = searcher.extract_info(entry_url, download=False)
-            if metadata:
-                metadata.setdefault("webpage_url", entry_url)
-                if (
-                    has_allowed_license(metadata.get("license"))
-                    and _candidate_is_eligible(metadata, entry_url)
-                ):
-                    candidates.append(metadata)
+            if not isinstance(metadata, dict) or not metadata:
+                # Keep the usable search result as a last-resort candidate.
+                metadata = dict(entry)
+            metadata.setdefault("webpage_url", entry_url)
+            if not _is_shorts_url(str(metadata.get("webpage_url", ""))):
+                # if (
+                #     has_allowed_license(metadata.get("license"))
+                #     and _candidate_is_eligible(metadata, entry_url)
+                # ):
+                candidates.append(metadata)
             if progress_callback:
                 progress_callback(
                     {
@@ -175,7 +242,7 @@ def download_matches(
                         "stage_progress": int((index + 1) * 100 / max(1, len(entries))),
                         # "message": f"Verifica licenze dei risultati ({index + 1}/{len(entries)}).",
                         "message": (
-                            "Verifica licenze, durata e orientamento dei risultati "
+                            "Verifica durata, orientamento e alternative dei risultati "
                             f"({index + 1}/{len(entries)})."
                         ),
                     }
@@ -183,8 +250,9 @@ def download_matches(
             # if len(candidates) >= limit:
             #     break
 
-    candidates.sort(key=_candidate_priority, reverse=True)
-    candidates = candidates[:limit]
+    # candidates.sort(key=_candidate_priority, reverse=True)
+    # candidates = candidates[:limit]
+    candidates = _select_candidates(candidates, limit)
     if progress_callback:
         progress_callback(
             {
@@ -195,6 +263,8 @@ def download_matches(
             }
         )
 
+    # if not candidates:
+    #     return []
     if not candidates:
         return []
 
@@ -239,11 +309,11 @@ def download_matches(
         "noprogress": True,
         "logger": _QuietLogger(),
         "noplaylist": True,
-        #"match_filter": lambda info, *, incomplete: (
-        #    None
-        #    if incomplete or has_allowed_license(info.get("license"))
-        #    else "Licenza Creative Commons Attribution non verificata"
-        #),
+        # "match_filter": lambda info, *, incomplete: (
+        #     None
+        #     if incomplete or has_allowed_license(info.get("license"))
+        #     else "Licenza Creative Commons Attribution non verificata"
+        # ),
         "match_filter": _candidate_match_filter,
     }
     if progress_callback:
@@ -256,20 +326,16 @@ def download_matches(
             if not info:
                 raise RuntimeError(f"yt-dlp non ha restituito i dati per {candidate['webpage_url']}")
             license_name = info.get("license")
-            #if not has_allowed_license(license_name):
-            #    raise RuntimeError(
-            #        f"La licenza di {candidate.get('title', 'un video')} non è verificabile."
-            #    )
-            if not has_allowed_license(license_name):
-                raise RuntimeError(
-                    f"La licenza di {candidate.get('title', 'un video')} non è verificabile."
-                )
+            # if not has_allowed_license(license_name):
+            #     raise RuntimeError(
+            #         f"La licenza di {candidate.get('title', 'un video')} non è verificabile."
+            #     )
             downloaded.append(
                 {
                     "id": str(info.get("id", "")),
                     "title": str(info.get("title", "Titolo non disponibile")),
                     "url": str(info.get("webpage_url", candidate["webpage_url"])),
-                    "license": str(license_name),
+                    "license": str(license_name or "None"),
                     "file": str(info.get("filepath", "")),
                 }
             )
@@ -278,6 +344,10 @@ def download_matches(
 
 
 def main() -> int:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--keyword", required=True, help="Parola chiave o nicchia da cercare")
     parser.add_argument("--limit", type=int, default=2, help="Numero massimo di download (1-3)")

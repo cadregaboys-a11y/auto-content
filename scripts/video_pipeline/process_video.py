@@ -75,8 +75,8 @@ def run_pipeline(
         raise ValueError("Lingua non supportata. Usa de, en, es, fr, it o pt.")
     if not 5 <= len(brief.strip()) <= 400:
         raise ValueError("Lo spunto narrativo deve contenere da 5 a 400 caratteri.")
-    if not os.environ.get("ELEVENLABS_API_KEY") or not os.environ.get("ELEVENLABS_VOICE_ID"):
-        raise RuntimeError("Configura ELEVENLABS_API_KEY e ELEVENLABS_VOICE_ID nell'ambiente.")
+    # if not os.environ.get("ELEVENLABS_API_KEY") or not os.environ.get("ELEVENLABS_VOICE_ID"):
+    #     raise RuntimeError("Configura ELEVENLABS_API_KEY e ELEVENLABS_VOICE_ID nell'ambiente.")
 
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     output_directory = Path(
@@ -93,8 +93,10 @@ def run_pipeline(
     source_duration, motion_samples, focus_x = analyze_video(str(source_path))
     if source_duration < 5:
         raise ValueError("Il video deve durare almeno 5 secondi per generare una narrazione utile.")
-    scene = analyze_keyframes(source_path, source_duration)
-    retention_samples = motion_samples + list(scene.moments)
+    # scene = analyze_keyframes(source_path, source_duration)
+    scene = analyze_keyframes(source_path, source_duration, brief=brief)
+    # retention_samples = motion_samples + list(scene.moments)
+    retention_samples = list(scene.moments) if scene.moments else motion_samples
     report_progress(
         "frame_analysis",
         18,
@@ -109,7 +111,8 @@ def run_pipeline(
 
     # target_duration = min(source_duration * 0.9, 30.0)
     target_duration = NARRATION_TARGET_SECONDS
-    narration_path = output_directory / "narration.mp3"
+    # narration_path = output_directory / "narration.mp3"
+    narration_path = output_directory / "narration.wav"
     script = ""
     duration = 0.0
     for attempt in range(3):
@@ -132,9 +135,10 @@ def run_pipeline(
             "elevenlabs_synthesis",
             47,
             0,
-            f"Generazione della voce narrante (tentativo {attempt + 1}/3).",
+            f"Generazione della voce narrante con TTS locale (tentativo {attempt + 1}/3).",
         )
-        synthesize_narration(script, narration_path)
+        # synthesize_narration(script, narration_path)
+        synthesize_narration(script, narration_path, language)
         duration = audio_duration(narration_path)
         # if duration <= source_duration:
         if NARRATION_MIN_SECONDS <= duration <= NARRATION_MAX_SECONDS:
@@ -156,7 +160,8 @@ def run_pipeline(
             "dopo tre tentativi."
         )
 
-    report_progress("elevenlabs_synthesis", 60, 100, "Traccia narrata generata.")
+    # report_progress("elevenlabs_synthesis", 60, 100, "Traccia narrata generata.")
+    report_progress("elevenlabs_synthesis", 60, 100, "Voce narrante locale generata.")
 
     report_progress("narration_transcription", 62, 0, "Whisper allinea le parole della narrazione.")
     narration_transcription = transcribe(

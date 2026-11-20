@@ -62,7 +62,8 @@ export class App {
     frame_analysis: 'Analisi visiva locale',
     source_transcription: 'Trascrizione video · Whisper',
     story_generation: 'Script narrativo',
-    elevenlabs_synthesis: 'Voce narrante · ElevenLabs',
+    // elevenlabs_synthesis: 'Voce narrante · ElevenLabs',
+    elevenlabs_synthesis: 'Sintesi voce · TTS locale',
     narration_transcription: 'Timestamp parole · Whisper',
     rendering: 'Montaggio 9:16 e sottotitoli',
   };

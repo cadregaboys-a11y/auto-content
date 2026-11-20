@@ -151,6 +151,10 @@ function serializePipelineJob(job) {
 function runJobProcess(job, executable, args, cwd, onResult) {
   const child = spawn(executable, args, {
     cwd,
+    env: {
+      ...process.env,
+      PYTHONIOENCODING: 'utf-8',
+    },
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -421,12 +425,12 @@ app.post('/api/video-jobs', (request, response) => {
     return;
   }
 
-  if (!process.env.ELEVENLABS_API_KEY || !process.env.ELEVENLABS_VOICE_ID) {
-    response.status(503).json({
-      error: 'Configura ELEVENLABS_API_KEY e ELEVENLABS_VOICE_ID prima di avviare il job.',
-    });
-    return;
-  }
+  // if (!process.env.ELEVENLABS_API_KEY || !process.env.ELEVENLABS_VOICE_ID) {
+  //   response.status(503).json({
+  //     error: 'Configura ELEVENLABS_API_KEY e ELEVENLABS_VOICE_ID prima di avviare il job.',
+  //   });
+  //   return;
+  // }
 
   const activeJobs = [...jobs.values()].filter(
     (job) => job.status === 'queued' || job.status === 'running',
@@ -544,12 +548,12 @@ app.post('/api/video-processing', async (request, response) => {
     return;
   }
 
-  if (!process.env.ELEVENLABS_API_KEY || !process.env.ELEVENLABS_VOICE_ID) {
-    response.status(503).json({
-      error: 'Configura ELEVENLABS_API_KEY e ELEVENLABS_VOICE_ID prima di avviare il montaggio.',
-    });
-    return;
-  }
+  // if (!process.env.ELEVENLABS_API_KEY || !process.env.ELEVENLABS_VOICE_ID) {
+  //   response.status(503).json({
+  //     error: 'Configura ELEVENLABS_API_KEY e ELEVENLABS_VOICE_ID prima di avviare il montaggio.',
+  //   });
+  //   return;
+  // }
 
   const activeJobs = [...jobs.values()].filter(
     (job) => job.status === 'queued' || job.status === 'running',
@@ -639,6 +643,10 @@ app.post('/api/video-processing', async (request, response) => {
     ],
     {
       cwd: scriptsDirectory,
+      env: {
+        ...process.env,
+        PYTHONIOENCODING: 'utf-8',
+      },
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
     },
