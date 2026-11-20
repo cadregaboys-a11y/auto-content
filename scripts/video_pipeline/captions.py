@@ -1,4 +1,5 @@
-import os
+# import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -9,36 +10,99 @@ CAPTION_SHADOW = 2
 CAPTION_ALIGNMENT = 2
 CAPTION_MARGIN_L = 125
 CAPTION_MARGIN_R = 125
-CAPTION_MARGIN_V = 610
+# CAPTION_MARGIN_V = 610
+CAPTION_MARGIN_V = 640
 CAPTION_MAX_LINE_CHARACTERS = 20
 CAPTION_MAX_EVENT_CHARACTERS = CAPTION_MAX_LINE_CHARACTERS * 2
+CAPTION_FONT_DIRECTORY = Path(__file__).resolve().parents[2] / "backend" / "tts" / "fonts"
+CAPTION_KEYWORDS = {
+    "buio", "sangue", "ombra", "ombre", "morte", "morto", "morta", "urlo", "urla",
+    "silenzio", "paura", "presenza", "occhi", "dietro", "passi", "freddo",
+    "sussurro", "sussurra", "rumore", "vuoto", "notte", "fantasma", "mostro",
+    "sparito", "sparita", "seguito", "sola", "solo",
+}
+CAPTION_STOP_WORDS = {
+    "a", "ad", "al", "alla", "alle", "allo", "che", "chi", "ci", "con", "da",
+    "dal", "dalla", "de", "del", "della", "di", "e", "ed", "era", "è", "gli",
+    "ha", "hai", "hanno", "i", "il", "in", "io", "la", "le", "li", "lo", "ma",
+    "mi", "nei", "nel", "nella", "no", "non", "o", "per", "poi", "qui", "se",
+    "si", "sia", "sono", "su", "tra", "tu", "un", "una", "uno", "vi",
+}
 
 
 def _caption_font_name() -> str:
-    fonts_directory = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
-    try:
-        installed_stems = {
-            path.stem.casefold()
-            for path in fonts_directory.iterdir()
-            if path.is_file()
-        }
-    except OSError:
-        return "Georgia"
+    # fonts_directory = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
+    # try:
+    #     installed_stems = {
+    #         path.stem.casefold()
+    #         for path in fonts_directory.iterdir()
+    #         if path.is_file()
+    #     }
+    # except OSError:
+    #     return "Georgia"
+    #
+    # preferences = (
+    #     ("Chiller", "chiller"),
+    #     ("Creepster", "creepster"),
+    #     ("Cinzel", "cinzel"),
+    #     ("Impact", "impact"),
+    #     ("Georgia", "georgia"),
+    # )
+    # for family, stem in preferences:
+    #     if any(
+    #         installed == stem or installed.startswith(f"{stem}-")
+    #         for installed in installed_stems
+    #     ):
+    #         return family
+    # return "Georgia"
+    return _caption_font_names()[0]
 
-    preferences = (
-        ("Chiller", "chiller"),
-        ("Creepster", "creepster"),
-        ("Cinzel", "cinzel"),
-        ("Impact", "impact"),
-        ("Georgia", "georgia"),
+
+def _caption_font_names() -> list[str]:
+    if not CAPTION_FONT_DIRECTORY.is_dir():
+        return ["Arial"]
+    font_files = sorted(
+        path
+        for path in CAPTION_FONT_DIRECTORY.iterdir()
+        if path.is_file() and path.suffix.casefold() in {".ttf", ".otf"}
     )
-    for family, stem in preferences:
-        if any(
-            installed == stem or installed.startswith(f"{stem}-")
-            for installed in installed_stems
-        ):
-            return family
-    return "Georgia"
+    if not font_files:
+        return ["Arial"]
+
+    return [
+        re.sub(
+            r"(?<=[a-z])(?=[A-Z])",
+            " ",
+            re.sub(r"-(?:Regular|Bold|Italic)$", "", path.stem),
+        )
+        for path in font_files
+    ]
+
+
+def _caption_keyword_indices(words: list[str]) -> set[int]:
+    candidates: list[tuple[int, int, int]] = []
+    for index, word in enumerate(words):
+        normalized = re.sub(r"^[^\w]+|[^\w]+$", "", word.casefold())
+        if not normalized or normalized in CAPTION_STOP_WORDS:
+            continue
+        priority = int(normalized in CAPTION_KEYWORDS)
+        if priority or len(normalized) >= 5:
+            candidates.append((priority, len(normalized), -index))
+
+    if not candidates and words:
+        candidates = [
+            (
+                0,
+                len(re.sub(r"^[^\w]+|[^\w]+$", "", word)),
+                -index,
+            )
+            for index, word in enumerate(words)
+            if re.sub(r"^[^\w]+|[^\w]+$", "", word)
+        ]
+
+    candidates.sort(reverse=True)
+    maximum_keywords = min(3, max(1, (len(words) + 3) // 4))
+    return {-candidate[2] for candidate in candidates[:maximum_keywords]}
 
 
 def _ass_time(seconds: float) -> str:
@@ -82,16 +146,62 @@ def _escape_ass_text(text: str) -> str:
 #     if current_line:
 #         lines.append(" ".join(current_line))
 #     return r"\N".join(lines)
-def _wrap_caption_words(words: list[str]) -> str:
+# def _wrap_caption_words(words: list[str]) -> str:
+#     lines: list[str] = []
+#     current_line: list[str] = []
+#     line_characters = 0
+#
+#     for word in words:
+#         word = _escape_ass_text(word.strip())
+#         if not word:
+#             continue
+#         additional_characters = len(word) + (1 if current_line else 0)
+#         if (
+#             current_line
+#             and line_characters + additional_characters
+#             > CAPTION_MAX_LINE_CHARACTERS
+#         ):
+#             lines.append(" ".join(current_line))
+#             current_line = []
+#             line_characters = 0
+#
+#         if current_line:
+#             line_characters += 1
+#         current_line.append(word)
+#         line_characters += len(word)
+#
+#     if current_line:
+#         lines.append(" ".join(current_line))
+#     return r"\N".join(lines)
+def _wrap_caption_words(
+    words: list[str],
+    highlighted_indices: set[int] | None = None,
+    highlight_fonts: list[str] | None = None,
+    keyword_offset: int = 0,
+) -> str:
     lines: list[str] = []
     current_line: list[str] = []
     line_characters = 0
+    highlighted_count = 0
+    fonts = highlight_fonts or []
+    highlighted_indices = highlighted_indices or set()
 
-    for word in words:
-        word = _escape_ass_text(word.strip())
-        if not word:
+    for index, raw_word in enumerate(words):
+        plain_word = raw_word.strip().lower()
+        if not plain_word:
             continue
-        additional_characters = len(word) + (1 if current_line else 0)
+        visible_length = len(plain_word)
+        word = _escape_ass_text(plain_word)
+        if index in highlighted_indices and fonts:
+            font_name = fonts[(keyword_offset + highlighted_count) % len(fonts)]
+            highlighted_count += 1
+            # word = rf"{{\fn{_escape_ass_text(font_name)}\b1}}{word}{{\r}}"
+            word = (
+                rf"{{\fn{_escape_ass_text(font_name)}\b1}}"
+                f"{_escape_ass_text(plain_word.upper())}{{\\r}}"
+            )
+
+        additional_characters = visible_length + (1 if current_line else 0)
         if (
             current_line
             and line_characters + additional_characters
@@ -104,7 +214,7 @@ def _wrap_caption_words(words: list[str]) -> str:
         if current_line:
             line_characters += 1
         current_line.append(word)
-        line_characters += len(word)
+        line_characters += visible_length
 
     if current_line:
         lines.append(" ".join(current_line))
@@ -209,10 +319,24 @@ def write_word_captions(transcription: dict[str, Any], destination: Path) -> int
     #         f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},Default,,"
     #         f"{CAPTION_MARGIN_L},{CAPTION_MARGIN_R},{CAPTION_MARGIN_V},,{text}"
     #     )
+    # caption_groups = _caption_word_groups(words)
+    # for index, group in enumerate(caption_groups):
+    #     caption_words = [str(word["word"]).strip() for word in group]
+    #     text = _wrap_caption_words(caption_words)
     caption_groups = _caption_word_groups(words)
+    font_names = _caption_font_names()
+    keyword_fonts = font_names[1:] or font_names[:1]
+    next_keyword_index = 0
     for index, group in enumerate(caption_groups):
         caption_words = [str(word["word"]).strip() for word in group]
-        text = _wrap_caption_words(caption_words)
+        keyword_indices = _caption_keyword_indices(caption_words)
+        text = _wrap_caption_words(
+            caption_words,
+            highlighted_indices=keyword_indices,
+            highlight_fonts=keyword_fonts,
+            keyword_offset=next_keyword_index,
+        )
+        next_keyword_index += len(keyword_indices)
         start = float(group[0]["start"])
         end = float(group[-1]["end"])
         if index + 1 < len(caption_groups):

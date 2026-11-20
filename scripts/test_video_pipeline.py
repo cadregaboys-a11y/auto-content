@@ -1,10 +1,13 @@
 import io
 import json
+import re
+import sys
 import threading
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from typing import Any
 from urllib.error import HTTPError
 from urllib.request import Request
 from unittest.mock import patch
@@ -26,10 +29,190 @@ from video_pipeline.visual_analysis import (
 )
 
 
+def _animated_moment(
+    timestamp: float,
+    score: float,
+    focus_x: float = 0.5,
+    suitable: bool = True,
+    description: str = "",
+) -> VisualMoment:
+    return VisualMoment(
+        timestamp,
+        score,
+        focus_x,
+        suitable,
+        description,
+        has_text=False,
+        is_animated=True,
+    )
+
+
 class VideoPipelineTests(unittest.TestCase):
+    def test_clip_verification_rejects_text_in_an_interior_frame(self) -> None:
+        import numpy as np
+
+        class FakeCapture:
+            def set(self, *_args: Any) -> None:
+                return None
+
+            def read(self) -> tuple[bool, Any]:
+                return True, np.full((24, 24, 3), 80, dtype=np.uint8)
+
+            def release(self) -> None:
+                return None
+
+        sample = _animated_moment(15.0, 0.9)
+        motion = [VisualMoment(time, 0.02, 0.5) for time in range(13, 18)]
+        unsafe_analysis = SceneAnalysis(
+            "cartoon with visible words",
+            (),
+            tuple(
+                VisualMoment(
+                    timestamp,
+                    0.9,
+                    0.5,
+                    True,
+                    "cartoon with visible text",
+                    has_text=True,
+                    is_animated=True,
+                )
+                for timestamp in (12.5, 13.5, 14.5, 15.5, 16.5, 17.5)
+            ),
+        )
+        with (
+            patch.object(
+                visual_analysis,
+                "_open_video_capture",
+                return_value=FakeCapture(),
+            ),
+            patch.object(visual_analysis, "_call_ollama", return_value={}),
+            patch.object(
+                visual_analysis,
+                "_normalize_vision_response",
+                return_value=unsafe_analysis,
+            ),
+            patch.object(visual_analysis, "_report_frame_progress"),
+        ):
+            verified = visual_analysis.verify_retention_samples(
+                Path("source.mp4"),
+                [sample],
+                motion,
+                video_duration=40.0,
+            )
+
+        self.assertFalse(verified[0].suitable)
+
+    def test_clip_verification_accepts_animated_text_free_frames(self) -> None:
+        import numpy as np
+
+        class FakeCapture:
+            def set(self, *_args: Any) -> None:
+                return None
+
+            def read(self) -> tuple[bool, Any]:
+                return True, np.full((24, 24, 3), 80, dtype=np.uint8)
+
+            def release(self) -> None:
+                return None
+
+        sample = _animated_moment(15.0, 0.9)
+        motion = [VisualMoment(time, 0.02, 0.5) for time in range(13, 18)]
+        safe_analysis = SceneAnalysis(
+            "cartoon without visible text",
+            (),
+            tuple(
+                _animated_moment(timestamp, 0.9, description="anime without text")
+                for timestamp in (12.5, 13.5, 14.5, 15.5, 16.5, 17.5)
+            ),
+        )
+        with (
+            patch.object(
+                visual_analysis,
+                "_open_video_capture",
+                return_value=FakeCapture(),
+            ),
+            patch.object(visual_analysis, "_call_ollama", return_value={}),
+            patch.object(
+                visual_analysis,
+                "_normalize_vision_response",
+                return_value=safe_analysis,
+            ),
+            patch.object(visual_analysis, "_report_frame_progress"),
+        ):
+            verified = visual_analysis.verify_retention_samples(
+                Path("source.mp4"),
+                [sample],
+                motion,
+                video_duration=40.0,
+            )
+
+        self.assertTrue(verified[0].suitable)
+
+    def test_clip_verification_rejects_black_frames_before_rendering(self) -> None:
+        import numpy as np
+
+        class FakeCapture:
+            def set(self, *_args: Any) -> None:
+                return None
+
+            def read(self) -> tuple[bool, Any]:
+                return True, np.zeros((24, 24, 3), dtype=np.uint8)
+
+            def release(self) -> None:
+                return None
+
+        sample = _animated_moment(15.0, 0.9)
+        motion = [VisualMoment(time, 0.02, 0.5) for time in range(13, 18)]
+        with (
+            patch.object(
+                visual_analysis,
+                "_open_video_capture",
+                return_value=FakeCapture(),
+            ),
+            patch.object(visual_analysis, "_call_ollama") as call_ollama,
+            patch.object(visual_analysis, "_report_frame_progress"),
+        ):
+            verified = visual_analysis.verify_retention_samples(
+                Path("source.mp4"),
+                [sample],
+                motion,
+                video_duration=40.0,
+            )
+
+        self.assertFalse(verified[0].suitable)
+        call_ollama.assert_not_called()
+
+    def test_render_rejects_silent_narration_before_ffmpeg(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            narration_path = root / "narration.wav"
+            narration_path.write_bytes(b"wav")
+            with (
+                patch("video_pipeline.render._measure_audio_peak", return_value=float("-inf")),
+                patch("video_pipeline.render._report_render_progress"),
+                patch("video_pipeline.render.subprocess.run") as run,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "silenzioso"):
+                    render_vertical_short(
+                        root / "source.mp4",
+                        narration_path,
+                        root / "captions.ass",
+                        root / "final.mp4",
+                        [Clip(0.0, 2.0, 0.9)],
+                        focus_x=0.5,
+                        duration=2.0,
+                    )
+
+        run.assert_not_called()
+
     def test_retention_clips_are_chronological_and_match_target_duration(self) -> None:
         clips = choose_retention_clips(
-            [(2.0, 0.1), (12.0, 0.9), (22.0, 0.4)],
+            # [(2.0, 0.1), (12.0, 0.9), (22.0, 0.4)],
+            [
+                _animated_moment(2.0, 0.1),
+                _animated_moment(12.0, 0.9),
+                _animated_moment(22.0, 0.4),
+            ],
             video_duration=30.0,
             target_duration=9.0,
         )
@@ -43,7 +226,8 @@ class VideoPipelineTests(unittest.TestCase):
 
     def test_retention_clips_repeat_short_source_to_match_target_duration(self) -> None:
         clips = choose_retention_clips(
-            [],
+            # [],
+            [_animated_moment(2.0, 0.9)],
             video_duration=4.0,
             target_duration=10.0,
         )
@@ -55,11 +239,26 @@ class VideoPipelineTests(unittest.TestCase):
     def test_render_uses_narration_duration_for_repeated_clips(self) -> None:
         clips = [Clip(0.0, 4.0, 0.0), Clip(0.0, 4.0, 0.0), Clip(0.0, 2.0, 0.0)]
         with tempfile.TemporaryDirectory() as temporary:
-            with patch("video_pipeline.render.subprocess.run") as run:
+            with (
+                patch(
+                    "video_pipeline.render.MUSIC_DIRECTORY",
+                    Path(temporary) / "empty-music",
+                ),
+                patch("video_pipeline.render._measure_audio_peak", return_value=-12.0),
+                patch(
+                    "video_pipeline.render._verify_rendered_audio",
+                    return_value=("aac", -10.0),
+                ),
+                patch("video_pipeline.render._report_render_progress"),
+                patch("video_pipeline.render.subprocess.run") as run,
+            ):
+                narration_path = Path(temporary) / "narration.wav"
+                narration_path.write_bytes(b"test wav")
                 render_vertical_short(
                     Path(temporary) / "source.mp4",
                     # Path(temporary) / "narration.mp3",
-                    Path(temporary) / "narration.wav",
+                    # Path(temporary) / "narration.wav",
+                    narration_path,
                     Path(temporary) / "captions.ass",
                     Path(temporary) / "final.mp4",
                     clips,
@@ -71,8 +270,56 @@ class VideoPipelineTests(unittest.TestCase):
         self.assertEqual(command[command.index("-t") + 1], "10.000")
         filter_graph = command[command.index("-filter_complex") + 1]
         self.assertIn("concat=n=3", filter_graph)
-        self.assertIn("[video]subtitles=captions.ass[output]", filter_graph)
+        # self.assertIn("[video]subtitles=captions.ass[output]", filter_graph)
+        self.assertIn("[video]subtitles=filename='captions.ass':", filter_graph)
+        self.assertIn("fontsdir=", filter_graph)
+        # self.assertIn("[1:a]anull[finalaudio]", filter_graph)
+        self.assertIn("[1:a]loudnorm=I=-16:TP=-1.5:LRA=7[finalaudio]", filter_graph)
+        self.assertIn("[finalaudio]", command)
         self.assertNotIn("force_style", filter_graph)
+
+    def test_render_mixes_optional_music_under_narration(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            music_directory = root / "music"
+            music_directory.mkdir()
+            music_path = music_directory / "horror.mp3"
+            music_path.touch()
+            narration_path = root / "narration.wav"
+            narration_path.write_bytes(b"test wav")
+            with (
+                patch("video_pipeline.render.MUSIC_DIRECTORY", music_directory),
+                patch("video_pipeline.render._measure_audio_peak", return_value=-12.0),
+                patch(
+                    "video_pipeline.render._verify_rendered_audio",
+                    return_value=("aac", -10.0),
+                ),
+                patch("video_pipeline.render._report_render_progress"),
+                patch("video_pipeline.render.subprocess.run") as run,
+            ):
+                render_vertical_short(
+                    root / "source.mp4",
+                    # root / "narration.wav",
+                    narration_path,
+                    root / "captions.ass",
+                    root / "final.mp4",
+                    [Clip(0.0, 35.0, 0.9)],
+                    focus_x=0.5,
+                    duration=35.0,
+                )
+
+        command = run.call_args.args[0]
+        filter_graph = command[command.index("-filter_complex") + 1]
+        self.assertEqual(
+            command[command.index("-stream_loop") + 1],
+            "-1",
+        )
+        self.assertIn(str(music_path), command)
+        self.assertIn("volume=0.1", filter_graph)
+        self.assertIn("afade=t=out:st=34.000:d=1.000", filter_graph)
+        self.assertIn("[1:a]loudnorm=I=-16:TP=-1.5:LRA=7[voice]", filter_graph)
+        self.assertIn("[voice][music]amix=inputs=2", filter_graph)
+        self.assertIn("[finalaudio]", command)
 
     def test_whisper_receives_generated_wav_for_word_timestamps(self) -> None:
         class FakeWhisperModel:
@@ -92,7 +339,8 @@ class VideoPipelineTests(unittest.TestCase):
 
     def test_retention_clips_keep_multimodal_focus_position(self) -> None:
         clips = choose_retention_clips(
-            [VisualMoment(timestamp=5.0, score=0.9, focus_x=0.82)],
+            # [VisualMoment(timestamp=5.0, score=0.9, focus_x=0.82)],
+            [_animated_moment(timestamp=5.0, score=0.9, focus_x=0.82)],
             video_duration=20.0,
             target_duration=4.0,
         )
@@ -102,8 +350,8 @@ class VideoPipelineTests(unittest.TestCase):
     def test_retention_clips_prefer_suitable_moments_over_rejected_frames(self) -> None:
         clips = choose_retention_clips(
             [
-                VisualMoment(3.0, 0.99, 0.5, suitable=False),
-                VisualMoment(20.0, 0.1, 0.5, suitable=True),
+                _animated_moment(3.0, 0.99, suitable=False),
+                _animated_moment(20.0, 0.1),
             ],
             video_duration=40.0,
             target_duration=6.0,
@@ -111,23 +359,25 @@ class VideoPipelineTests(unittest.TestCase):
 
         self.assertEqual(clips[0].start, 17.0)
 
-    def test_retention_clips_fall_back_to_best_interior_candidate(self) -> None:
+    # def test_retention_clips_fall_back_to_best_interior_candidate(self) -> None:
+    def test_retention_clips_reject_all_unsuitable_moments(self) -> None:
         clips = choose_retention_clips(
             [
-                VisualMoment(3.0, 0.99, 0.5, suitable=False),
-                VisualMoment(20.0, 0.1, 0.5, suitable=False),
+                _animated_moment(3.0, 0.99, suitable=False),
+                _animated_moment(20.0, 0.1, suitable=False),
             ],
             video_duration=40.0,
             target_duration=6.0,
         )
 
-        self.assertEqual(clips[0].start, 17.0)
+        # self.assertEqual(clips[0].start, 17.0)
+        self.assertEqual(clips, [])
 
     def test_retention_clips_keep_best_interior_sample_when_all_scores_are_low(self) -> None:
         clips = choose_retention_clips(
             [
-                VisualMoment(3.0, 0.1, 0.5, suitable=True),
-                VisualMoment(20.0, 0.2, 0.5, suitable=True),
+                _animated_moment(3.0, 0.1),
+                _animated_moment(20.0, 0.2),
             ],
             video_duration=40.0,
             target_duration=6.0,
@@ -140,8 +390,8 @@ class VideoPipelineTests(unittest.TestCase):
         rejected_end = 27.0
         clips = choose_retention_clips(
             [
-                VisualMoment(3.0, 0.8, 0.5, suitable=True),
-                VisualMoment(24.0, 0.99, 0.5, suitable=False),
+                _animated_moment(3.0, 0.8),
+                _animated_moment(24.0, 0.99, suitable=False),
             ],
             video_duration=48.0,
             target_duration=30.0,
@@ -157,8 +407,59 @@ class VideoPipelineTests(unittest.TestCase):
 
     def test_retention_filler_prefers_interior_windows(self) -> None:
         clips = choose_retention_clips(
-            [],
+            # [],
+            [_animated_moment(15.0, 0.8)],
             video_duration=30.0,
+            target_duration=6.0,
+        )
+
+        self.assertEqual(clips[0].start, 12.0)
+
+    def test_retention_never_selects_text_or_live_action_moments(self) -> None:
+        clips = choose_retention_clips(
+            [
+                VisualMoment(
+                    14.0,
+                    0.99,
+                    0.5,
+                    True,
+                    "cartoon con sottotitoli",
+                    has_text=False,
+                    is_animated=True,
+                ),
+                VisualMoment(
+                    22.0,
+                    0.99,
+                    0.5,
+                    True,
+                    "animazione pulita",
+                    has_text=True,
+                    is_animated=True,
+                ),
+                VisualMoment(
+                    30.0,
+                    0.99,
+                    0.5,
+                    True,
+                    "una persona in una stanza",
+                    has_text=False,
+                    is_animated=False,
+                ),
+            ],
+            video_duration=44.0,
+            target_duration=6.0,
+        )
+
+        self.assertEqual(clips, [])
+
+    def test_retention_prefers_clean_interior_frames_over_intro_and_outro(self) -> None:
+        clips = choose_retention_clips(
+            [
+                _animated_moment(3.0, 0.99),
+                _animated_moment(15.0, 0.1),
+                _animated_moment(37.0, 0.99),
+            ],
+            video_duration=44.0,
             target_duration=6.0,
         )
 
@@ -254,7 +555,11 @@ class VideoPipelineTests(unittest.TestCase):
         self.assertEqual(text_request["options"]["repeat_penalty"], 1.25)
         self.assertEqual(text_request["options"]["repeat_last_n"], 128)
         self.assertEqual(vision_request["model"], "qwen2.5vl:3b")
-        self.assertEqual(vision_request["format"], "json")
+        # self.assertEqual(vision_request["format"], "json")
+        self.assertEqual(
+            vision_request["format"],
+            visual_analysis.VISION_JSON_SCHEMA,
+        )
         self.assertEqual(vision_request["options"]["repeat_penalty"], 1.25)
         self.assertEqual(vision_request["options"]["repeat_last_n"], 128)
         self.assertEqual(
@@ -262,6 +567,294 @@ class VideoPipelineTests(unittest.TestCase):
             visual_analysis.OLLAMA_MAX_VISION_FRAMES,
         )
         self.assertEqual(visual_analysis.OLLAMA_CONTEXT_WINDOW, 16_384)
+
+    def test_vision_response_uses_fallbacks_for_partial_fields(self) -> None:
+        scene = visual_analysis._normalize_vision_response(
+            {
+                "scene_summary": "",
+                "actions": ["", "Persona cammina"],
+                "moments": [
+                    {"time_seconds": 4.0},
+                    {"score": 0.8, "suitable": "true"},
+                ],
+            },
+            duration=20.0,
+            timestamps=[0.0, 4.0, 8.0, 12.0, 16.0],
+        )
+
+        self.assertIn("non descritta", scene.summary)
+        self.assertEqual(scene.actions, ("Persona cammina",))
+        self.assertGreaterEqual(len(scene.moments), 2)
+        self.assertEqual(scene.moments[0].timestamp, 4.0)
+        self.assertEqual(scene.moments[0].score, 0.5)
+        self.assertEqual(scene.moments[0].focus_x, 0.5)
+        self.assertTrue(scene.moments[1].suitable)
+        self.assertTrue(scene.moments[0].has_text)
+        self.assertFalse(scene.moments[0].is_animated)
+
+    def test_vision_prompt_requires_text_and_animation_flags(self) -> None:
+        prompt = visual_analysis._build_vision_prompt(
+            "anime horror",
+            ["Immagine 1: t=12.00s."],
+        )
+
+        self.assertIn("has_text=true", prompt)
+        self.assertIn("is_animated=true", prompt)
+        # self.assertIn("sottotitoli", prompt)
+        self.assertIn("sottotitolo", prompt)
+        # self.assertIn("restituisci un momento per ogni immagine", prompt)
+        self.assertIn("un elemento per ogni immagine", prompt)
+        self.assertIn("scene_summary, actions e moments", prompt)
+        self.assertIn("non omettere né rinominare chiavi", prompt)
+        self.assertFalse(
+            visual_analysis._description_signals_visible_text(
+                "Cartoon, no visible text or logo."
+            )
+        )
+        self.assertTrue(
+            visual_analysis._description_signals_visible_text(
+                "No text except subtitles."
+            )
+        )
+
+    def test_vision_parser_accepts_only_explicit_text_free_animation(self) -> None:
+        scene = visual_analysis._normalize_vision_response(
+            {
+                "scene_summary": "Animazione senza testo o loghi.",
+                "actions": ["Figure disegnate attraversano la scena."],
+                "moments": [
+                    {
+                        "time_seconds": 15,
+                        "description": "Cartoon senza testo o loghi.",
+                        "has_text": False,
+                        "is_animated": True,
+                        "suitable": True,
+                    },
+                    {
+                        "time_seconds": 22,
+                        "description": "Sottotitoli visibili.",
+                        "has_text": False,
+                        "is_animated": True,
+                        "suitable": True,
+                    },
+                ],
+            },
+            duration=40.0,
+            timestamps=[0, 8, 16, 24, 32, 39],
+        )
+
+        self.assertTrue(visual_analysis._moment_is_safe_for_retention(scene.moments[0]))
+        self.assertTrue(scene.moments[1].has_text)
+        self.assertFalse(visual_analysis._moment_is_safe_for_retention(scene.moments[1]))
+
+    def test_vision_response_rejects_only_empty_or_unusable_data(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "vuota o inutilizzabile"):
+            visual_analysis._normalize_vision_response(
+                {"scene_summary": "", "actions": [], "moments": []},
+                duration=20.0,
+                timestamps=[0.0, 4.0, 8.0],
+            )
+
+    def test_vision_normalizer_accepts_nested_description_aliases(self) -> None:
+        scene = visual_analysis._normalize_vision_response(
+            {
+                "result": {
+                    "caption": "A dark hand-drawn hallway.",
+                    "frames": [
+                        {
+                            "timestamp": 4.0,
+                            "description": "Cartoon hallway, no visible text.",
+                            "has_text": False,
+                            "is_animated": True,
+                        },
+                        "A shadow moves across the wall.",
+                    ],
+                }
+            },
+            duration=20.0,
+            timestamps=[0.0, 4.0, 8.0],
+        )
+
+        self.assertEqual(scene.summary, "A dark hand-drawn hallway.")
+        self.assertEqual(scene.moments[0].timestamp, 4.0)
+        self.assertTrue(visual_analysis._moment_is_safe_for_retention(scene.moments[0]))
+        self.assertTrue(scene.moments[1].has_text)
+        # self.assertFalse(scene.moments[1].is_animated)
+        self.assertTrue(scene.moments[1].is_animated)
+
+    def test_vision_description_only_moment_is_not_treated_as_empty(self) -> None:
+        scene = visual_analysis._normalize_vision_response(
+            {
+                "moments": [
+                    {
+                        "description": "A shadow crosses a drawn hallway.",
+                        "has_text": False,
+                        "is_animated": True,
+                    }
+                ]
+            },
+            duration=20.0,
+            timestamps=[4.0, 8.0],
+        )
+
+        self.assertIn("shadow", scene.summary)
+        self.assertEqual(scene.moments[0].timestamp, 4.0)
+        self.assertTrue(visual_analysis._moment_is_safe_for_retention(scene.moments[0]))
+
+    def test_partial_summary_supplies_only_explicitly_safe_fallbacks(self) -> None:
+        scene = visual_analysis._normalize_vision_response(
+            {"scene_summary": "Hand-drawn cartoon, no visible text or logos."},
+            duration=20.0,
+            timestamps=[4.0, 8.0],
+        )
+
+        self.assertEqual(len(scene.moments), 2)
+        self.assertTrue(
+            all(
+                visual_analysis._moment_is_safe_for_retention(moment)
+                for moment in scene.moments
+            )
+        )
+
+    def test_partial_moments_fill_missing_frames_without_weakening_safety(self) -> None:
+        scene = visual_analysis._normalize_vision_response(
+            {
+                "scene_summary": "Hand-drawn cartoon, no visible text.",
+                "moments": [{"description": "A shadow crosses the hallway."}],
+            },
+            duration=30.0,
+            timestamps=[4.0, 12.0, 20.0],
+        )
+
+        self.assertEqual(len(scene.moments), 3)
+        self.assertTrue(
+            all(
+                visual_analysis._moment_is_safe_for_retention(moment)
+                for moment in scene.moments
+            )
+        )
+
+    def test_ambiguous_partial_summary_keeps_fallback_unsafe(self) -> None:
+        scene = visual_analysis._normalize_vision_response(
+            {
+                "scene_summary": "A dim scene.",
+                "moments": [{"description": "A shape moves across the frame."}],
+            },
+            duration=20.0,
+            timestamps=[4.0, 8.0],
+        )
+
+        self.assertFalse(visual_analysis._moment_is_safe_for_retention(scene.moments[0]))
+
+    def test_ollama_parser_accepts_markdown_fenced_json(self) -> None:
+        response = {
+            "message": {
+                "content": '```json\n{"caption":"A dark animated scene."}\n```'
+            }
+        }
+        with (
+            patch.object(visual_analysis, "_ollama_url", return_value="http://localhost"),
+            patch.object(visual_analysis, "_request_ollama", return_value=response),
+            patch.object(visual_analysis, "_report_frame_progress"),
+        ):
+            result = visual_analysis._call_ollama("Analizza la scena.", ["frame"])
+
+        self.assertEqual(result["caption"], "A dark animated scene.")
+
+    def test_ollama_accepts_plain_text_as_vision_description_fallback(self) -> None:
+        response = {"message": {"content": "Una stanza buia con una persona ferma."}}
+        with (
+            patch.object(visual_analysis, "_ollama_url", return_value="http://localhost"),
+            patch.object(visual_analysis, "_request_ollama", return_value=response),
+            patch.object(visual_analysis, "_report_frame_progress"),
+        ):
+            result = visual_analysis._call_ollama(
+                "Analizza la scena.",
+                ["frame"],
+            )
+
+        self.assertEqual(
+            result["scene_summary"],
+            "Una stanza buia con una persona ferma.",
+        )
+
+    def test_ollama_preserves_moments_from_top_level_json_array(self) -> None:
+        moment = {
+            "description": "Cartoon senza testo.",
+            "has_text": False,
+            "is_animated": True,
+            "time_seconds": 4.0,
+        }
+        response = {"message": {"content": json.dumps([moment])}}
+        with (
+            patch.object(visual_analysis, "_ollama_url", return_value="http://localhost"),
+            patch.object(visual_analysis, "_request_ollama", return_value=response),
+            patch.object(visual_analysis, "_report_frame_progress") as report_progress,
+        ):
+            result = visual_analysis._call_ollama("Analizza la scena.", ["frame"])
+
+        self.assertEqual(result, {"moments": [moment]})
+        self.assertTrue(
+            any(
+                "array JSON" in call.args[1]
+                and "Cartoon senza testo." in call.args[1]
+                for call in report_progress.call_args_list
+            )
+        )
+
+    def test_ollama_logs_raw_response_when_moment_count_differs(self) -> None:
+        moment = {
+            "time_seconds": 4.0,
+            "description": "Cartoon senza testo.",
+            "has_text": False,
+            "is_animated": True,
+            "score": 0.8,
+            "focus_x": 0.5,
+            "suitable": True,
+        }
+        response = {
+            "message": {
+                "content": json.dumps(
+                    {
+                        "scene_summary": "Cartoon senza testo.",
+                        "actions": ["Una figura si muove."],
+                        "moments": [moment],
+                    }
+                )
+            }
+        }
+        with (
+            patch.object(visual_analysis, "_ollama_url", return_value="http://localhost"),
+            patch.object(visual_analysis, "_request_ollama", return_value=response),
+            patch.object(visual_analysis, "_report_frame_progress") as report_progress,
+        ):
+            visual_analysis._call_ollama(
+                "Analizza le immagini.",
+                ["frame-1", "frame-2"],
+            )
+
+        self.assertTrue(
+            any(
+                "numero di moments diverso" in call.args[1]
+                and "Cartoon senza testo." in call.args[1]
+                for call in report_progress.call_args_list
+            )
+        )
+
+    def test_ollama_reads_text_fallback_from_alternate_response_field(self) -> None:
+        response = {"response": "Una scena animata e priva di scritte."}
+        with (
+            patch.object(visual_analysis, "_ollama_url", return_value="http://localhost"),
+            patch.object(visual_analysis, "_request_ollama", return_value=response),
+            patch.object(visual_analysis, "_report_frame_progress") as report_progress,
+        ):
+            result = visual_analysis._call_ollama("Analizza la scena.", ["frame"])
+
+        self.assertEqual(
+            result["scene_summary"],
+            "Una scena animata e priva di scritte.",
+        )
+        self.assertTrue(report_progress.called)
 
     def test_ollama_retries_token_repeat_errors_with_increasing_temperature(self) -> None:
         repeat_error = RuntimeError(
@@ -309,6 +902,29 @@ class VideoPipelineTests(unittest.TestCase):
                 visual_analysis._call_ollama("Analizza la scena.", ["frame"])
 
         self.assertEqual(request_ollama.call_count, 1)
+
+    def test_story_prompt_includes_audio_duration_feedback(self) -> None:
+        scene = SceneAnalysis(
+            summary="Una pressa idraulica schiaccia oggetti.",
+            actions=("La pressa comprime una serie di oggetti.",),
+            moments=(VisualMoment(3.0, 0.9, 0.5),),
+        )
+        narration = " ".join(f"parola{index}" for index in range(90))
+        feedback = "La traccia precedente durava 28.0s, 2.0s sotto il minimo."
+        with patch(
+            "video_pipeline.visual_analysis._call_ollama",
+            return_value={"narration": narration},
+        ) as ollama:
+            generate_storytelling_script(
+                "Un esperimento soddisfacente",
+                scene,
+                "",
+                target_duration=35.0,
+                language="it",
+                duration_feedback=feedback,
+            )
+
+        self.assertIn(feedback, ollama.call_args.args[0])
 
     def test_long_story_retries_short_output_and_targets_75_to_115_words(self) -> None:
         scene = SceneAnalysis(
@@ -489,13 +1105,29 @@ class VideoPipelineTests(unittest.TestCase):
         self.assertEqual(len(truncated.split()), 115)
         self.assertEqual(truncated.split()[-1], "parola114.")
 
-    def test_pipeline_retries_for_target_audio_and_repeats_short_source(self) -> None:
-        script = " ".join(f"parola{index}" for index in range(90))
+    # def test_pipeline_retries_for_target_audio_and_repeats_short_source(self) -> None:
+    def test_pipeline_retries_for_target_audio_using_only_safe_animation(self) -> None:
+        scripts = [
+            " ".join(f"tentativo{attempt}_parola{index}" for index in range(90))
+            for attempt in range(1, 4)
+        ]
         scene = SceneAnalysis(
             summary="La pressa schiaccia oggetti.",
             actions=("La pressa scende e comprime.",),
-            moments=(VisualMoment(4.0, 0.9, 0.5),),
+            # moments=(VisualMoment(4.0, 0.9, 0.5),),
+            moments=(
+                _animated_moment(15.0, 0.9),
+                _animated_moment(28.0, 0.8),
+            ),
         )
+
+        def write_test_audio(script: str, destination: Path, language: str) -> None:
+            destination.write_bytes(script.encode("utf-8"))
+
+        rendered_narration: list[bytes] = []
+
+        def capture_rendered_narration(*args: Any, **kwargs: Any) -> None:
+            rendered_narration.append(args[1].read_bytes())
 
         with tempfile.TemporaryDirectory() as temporary:
             project_root = Path(temporary)
@@ -516,8 +1148,14 @@ class VideoPipelineTests(unittest.TestCase):
                     "validate_input",
                     return_value=project_root / "source.mp4",
                 ),
-                patch.object(process_video, "analyze_video", return_value=(8.0, [], 0.5)),
+                # patch.object(process_video, "analyze_video", return_value=(8.0, [], 0.5)),
+                patch.object(process_video, "analyze_video", return_value=(40.0, [], 0.5)),
                 patch.object(process_video, "analyze_keyframes", return_value=scene),
+                patch.object(
+                    process_video,
+                    "verify_retention_samples",
+                    return_value=list(scene.moments),
+                ),
                 patch.object(process_video, "load_whisper_model", return_value=object()),
                 patch.object(
                     process_video,
@@ -527,12 +1165,28 @@ class VideoPipelineTests(unittest.TestCase):
                 patch.object(
                     process_video,
                     "generate_storytelling_script",
-                    side_effect=[script, script],
+                    # side_effect=[script, script],
+                    side_effect=scripts,
                 ) as generate_script,
-                patch.object(process_video, "synthesize_narration") as synthesize,
-                patch.object(process_video, "audio_duration", side_effect=[4.0, 35.0]),
+                # patch.object(process_video, "synthesize_narration") as synthesize,
+                patch.object(
+                    process_video,
+                    "synthesize_narration",
+                    side_effect=write_test_audio,
+                ) as synthesize,
+                # patch.object(process_video, "audio_duration", side_effect=[4.0, 35.0]),
+                patch.object(
+                    process_video,
+                    "audio_duration",
+                    side_effect=[28.0, 42.0, 36.0],
+                ),
                 patch.object(process_video, "write_word_captions", return_value=90),
-                patch.object(process_video, "render_vertical_short") as render,
+                # patch.object(process_video, "render_vertical_short") as render,
+                patch.object(
+                    process_video,
+                    "render_vertical_short",
+                    side_effect=capture_rendered_narration,
+                ) as render,
                 redirect_stdout(io.StringIO()),
             ):
                 result = process_video.run_pipeline(
@@ -543,18 +1197,60 @@ class VideoPipelineTests(unittest.TestCase):
                     rights_confirmed=True,
                 )
 
-        self.assertEqual(result["duration_seconds"], 35.0)
+        # self.assertEqual(result["duration_seconds"], 35.0)
+        self.assertEqual(result["duration_seconds"], 36.0)
         self.assertEqual(generate_script.call_args_list[0].args[3], 35.0)
-        self.assertEqual(generate_script.call_args_list[1].args[3], 40.0)
-        self.assertEqual(synthesize.call_count, 2)
+        # self.assertEqual(generate_script.call_args_list[1].args[3], 40.0)
+        self.assertEqual(generate_script.call_count, 3)
+        self.assertIn("sotto il minimo", generate_script.call_args_list[1].kwargs["duration_feedback"])
+        self.assertIn("sopra il massimo", generate_script.call_args_list[2].kwargs["duration_feedback"])
+        # self.assertEqual(synthesize.call_count, 2)
+        self.assertEqual(synthesize.call_count, 3)
         self.assertEqual(synthesize.call_args.args[1].suffix, ".wav")
         self.assertEqual(synthesize.call_args.args[2], "it")
+        # The third attempt is closest to the 35-second target and is rendered.
+        self.assertEqual(rendered_narration, [scripts[2].encode("utf-8")])
         rendered_clips = render.call_args.args[4]
         self.assertAlmostEqual(
             sum(clip.end - clip.start for clip in rendered_clips),
-            35.0,
+            36.0,
         )
-        self.assertTrue(all(clip.end <= 8.0 for clip in rendered_clips))
+        # self.assertTrue(all(clip.end <= 8.0 for clip in rendered_clips))
+        self.assertTrue(all(clip.start >= 8.0 and clip.end <= 32.0 for clip in rendered_clips))
+
+    def test_pipeline_reports_candidate_rejection_for_sequential_retry(self) -> None:
+        output = io.StringIO()
+        with (
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "process_video",
+                    "--input",
+                    "source.mp4",
+                    "--video-id",
+                    "video123",
+                    "--brief",
+                    "Un breve spunto",
+                    "--rights-confirmed",
+                    "--allow-candidate-rejection",
+                ],
+            ),
+            patch.object(
+                process_video,
+                "run_pipeline",
+                side_effect=process_video.CandidateRejectedError(
+                    "Il video contiene testo visibile."
+                ),
+            ),
+            redirect_stdout(output),
+        ):
+            result = process_video.main()
+
+        self.assertEqual(result, 0)
+        event = json.loads(output.getvalue())
+        self.assertEqual(event["type"], "result")
+        self.assertTrue(event["candidate_rejected"])
 
     def test_ollama_endpoint_must_be_local(self) -> None:
         with patch.dict("os.environ", {"OLLAMA_HOST": "http://example.com:11434"}):
@@ -638,11 +1334,14 @@ class VideoPipelineTests(unittest.TestCase):
             "segments": [
                 {
                     "words": [
-                        {"word": "Ciao", "start": 0.0, "end": 0.4},
-                        # {"word": "mondo", "start": 0.4, "end": 0.9},
-                        {"word": "mondo.", "start": 0.4, "end": 0.9},
-                        {"word": "Nuova", "start": 1.0, "end": 1.4},
-                        {"word": "frase.", "start": 1.4, "end": 1.8},
+                        # {"word": "Ciao", "start": 0.0, "end": 0.4},
+                        {"word": "La", "start": 0.0, "end": 0.4},
+                        # {"word": "mondo.", "start": 0.4, "end": 0.9},
+                        {"word": "ombra.", "start": 0.4, "end": 0.9},
+                        # {"word": "Nuova", "start": 1.0, "end": 1.4},
+                        {"word": "Il", "start": 1.0, "end": 1.4},
+                        # {"word": "frase.", "start": 1.4, "end": 1.8},
+                        {"word": "buio.", "start": 1.4, "end": 1.8},
                     ]
                 }
             ]
@@ -660,8 +1359,10 @@ class VideoPipelineTests(unittest.TestCase):
         self.assertEqual(len(dialogue_lines), 2)
         # self.assertIn("0:00:00.00,0:00:00.40", contents)
         self.assertIn("0:00:00.00,0:00:01.00", dialogue_lines[0])
-        self.assertIn("Ciao mondo.", dialogue_lines[0])
-        self.assertIn("Nuova frase.", dialogue_lines[1])
+        # self.assertIn("Ciao mondo.", dialogue_lines[0])
+        self.assertIn(r"la {\fnNosifer\b1}OMBRA.{\r}", dialogue_lines[0])
+        # self.assertIn("Nuova frase.", dialogue_lines[1])
+        self.assertIn(r"il {\fnSpecial Elite\b1}BUIO.{\r}", dialogue_lines[1])
         # self.assertIn(r"{\c&H0000FFFF&\b1}", contents)
         self.assertNotIn(r"{\c", contents)
         self.assertNotRegex(contents, r"\\(?:k|kf|ko|move|pos)")
@@ -670,7 +1371,8 @@ class VideoPipelineTests(unittest.TestCase):
             f"Style: Default,{captions._caption_font_name()},78,",
             contents,
         )
-        self.assertIn(",5,2,2,125,125,610,1", contents)
+        # self.assertIn(",5,2,2,125,125,610,1", contents)
+        self.assertIn(",5,2,2,125,125,640,1", contents)
 
     def test_word_captions_wrap_lines_and_apply_safe_margins(self) -> None:
         words = [
@@ -683,16 +1385,20 @@ class VideoPipelineTests(unittest.TestCase):
             contents = destination.read_text(encoding="utf-8")
 
         self.assertIn(r"\N", contents)
-        self.assertIn("Default,,125,125,610,,", contents)
+        # self.assertIn("Default,,125,125,610,,", contents)
+        self.assertIn("Default,,125,125,640,,", contents)
         subtitle_text = [
             line.split(",", 9)[9]
             for line in contents.splitlines()
             if line.startswith("Dialogue: ")
         ]
+        visible_subtitle_text = [
+            re.sub(r"\{[^}]*\}", "", line) for line in subtitle_text
+        ]
         self.assertTrue(
             all(
                 len(line) <= captions.CAPTION_MAX_LINE_CHARACTERS
-                for text in subtitle_text
+                for text in visible_subtitle_text
                 for line in text.split(r"\N")
             )
         )

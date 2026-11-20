@@ -71,7 +71,13 @@ PIPER_DIR_CANDIDATES, PIPER_DIR, PIPER_EXE = _resolve_piper_paths(
     configured_directory=os.environ.get("PIPER_DIR"),
     path_executable=shutil.which("piper"),
 )
+# DEFAULT_MODEL_NAMES = [
+#     "it_IT-alina-medium.onnx",
+#     "it_IT-paola-medium.onnx",
+#     "it_IT-riccardo-medium.onnx",
+# ]
 DEFAULT_MODEL_NAMES = [
+    "it_IT-riccardo-x_low.onnx",
     "it_IT-alina-medium.onnx",
     "it_IT-paola-medium.onnx",
     "it_IT-riccardo-medium.onnx",

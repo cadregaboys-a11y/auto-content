@@ -161,8 +161,34 @@ function runJobProcess(job, executable, args, cwd, onResult) {
   let stdoutBuffer = '';
   let stderr = '';
   let resultReceived = false;
+  let resultHandled = false;
+  let processClosed = false;
+  let processSucceeded = false;
   job.child = child;
   job.status = 'running';
+
+  const completeJobIfReady = () => {
+    if (
+      !processClosed ||
+      !processSucceeded ||
+      !resultHandled ||
+      job.status === 'failed' ||
+      job.progress !== 100 ||
+      !job.result
+    ) {
+      return;
+    }
+
+    job.status = 'completed';
+    job.stage = 'completed';
+    job.progress = 100;
+    job.message = 'Video verticale pronto.';
+    job.stages.forEach((stage) => {
+      stage.status = 'completed';
+      stage.progress = 100;
+    });
+    job.updatedAt = Date.now();
+  };
 
   const handleLine = (line) => {
     if (!line.trim() || job.status === 'failed') return;
@@ -185,6 +211,10 @@ function runJobProcess(job, executable, args, cwd, onResult) {
       resultReceived = true;
       Promise.resolve()
         .then(() => onResult(event, child))
+        .then(() => {
+          resultHandled = true;
+          completeJobIfReady();
+        })
         .catch((error) => {
           failPipelineJob(
             job,
@@ -230,17 +260,20 @@ function runJobProcess(job, executable, args, cwd, onResult) {
       return;
     }
 
-    if (job.progress === 100 && job.result) {
-      job.status = 'completed';
-      job.stage = 'completed';
-      job.progress = 100;
-      job.message = 'Video verticale pronto.';
-      job.stages.forEach((stage) => {
-        stage.status = 'completed';
-        stage.progress = 100;
-      });
-      job.updatedAt = Date.now();
-    }
+    // if (job.progress === 100 && job.result) {
+    //   job.status = 'completed';
+    //   job.stage = 'completed';
+    //   job.progress = 100;
+    //   job.message = 'Video verticale pronto.';
+    //   job.stages.forEach((stage) => {
+    //     stage.status = 'completed';
+    //     stage.progress = 100;
+    //   });
+    //   job.updatedAt = Date.now();
+    // }
+    processClosed = true;
+    processSucceeded = true;
+    completeJobIfReady();
   });
 }
 
@@ -280,7 +313,8 @@ async function findDownloadedVideo(videoId, reportedFile) {
   return inputPath;
 }
 
-function startVideoProcessing(job, videoId, inputPath, brief, language) {
+// function startVideoProcessing(job, videoId, inputPath, brief, language) {
+function startVideoProcessing(job, videoId, inputPath, brief, language, onCandidateRejected) {
   job.videoId = videoId;
   job.message = 'Video scaricato; avvio analisi e montaggio.';
   runJobProcess(
@@ -298,9 +332,16 @@ function startVideoProcessing(job, videoId, inputPath, brief, language) {
       '--language',
       language,
       '--rights-confirmed',
+      '--allow-candidate-rejection',
     ],
     scriptsDirectory,
-    (event, child) => {
+    async (event, child) => {
+      if (event.candidate_rejected === true) {
+        await onCandidateRejected(
+          String(event.reason ?? 'Il video non soddisfa i requisiti visivi.'),
+        );
+        return;
+      }
       if (typeof event.output_file !== 'string') {
         throw new Error('Il processo video non ha restituito il percorso del risultato.');
       }
@@ -325,38 +366,85 @@ function startVideoDownload(job, brief, language) {
   runJobProcess(
     job,
     process.env.PYTHON_EXECUTABLE || 'python',
-    [downloaderPath, '--keyword', job.keyword, '--limit', '1', '--progress'],
+    // [downloaderPath, '--keyword', job.keyword, '--limit', '1', '--progress'],
+    [downloaderPath, '--keyword', job.keyword, '--limit', '3', '--progress'],
     projectRoot,
     async (event) => {
       if (!Array.isArray(event.videos) || event.videos.length === 0) {
         throw new Error('Nessun video trovato per la parola chiave.');
       }
 
-      const video = event.videos[0];
-      if (
-        !video ||
-        typeof video.id !== 'string' ||
-        !/^[A-Za-z0-9_-]{6,32}$/.test(video.id) ||
-        typeof video.title !== 'string' ||
-        typeof video.url !== 'string'
-        // typeof video.license !== 'string' ||
-        // !video.license
-        //   .toLowerCase()
-        //   .startsWith('creative commons attribution license')
-      ) {
-        throw new Error('Il downloader non ha restituito un risultato valido.');
-      }
+      // const video = event.videos[0];
+      // if (
+      //   !video ||
+      //   typeof video.id !== 'string' ||
+      //   !/^[A-Za-z0-9_-]{6,32}$/.test(video.id) ||
+      //   typeof video.title !== 'string' ||
+      //   typeof video.url !== 'string'
+      //   // typeof video.license !== 'string' ||
+      //   // !video.license
+      //   //   .toLowerCase()
+      //   //   .startsWith('creative commons attribution license')
+      // ) {
+      //   throw new Error('Il downloader non ha restituito un risultato valido.');
+      // }
+      //
+      // const inputPath = await findDownloadedVideo(video.id, video.file);
+      // job.videoId = video.id;
+      // job.video = {
+      //   id: video.id,
+      //   title: video.title,
+      //   url: video.url,
+      //   license: video.license ?? 'None',
+      // };
+      // job.sourcePath = inputPath;
+      // startVideoProcessing(job, video.id, inputPath, brief, language);
+      let candidateIndex = 0;
+      const tryNextCandidate = async (rejectionReason) => {
+        if (candidateIndex >= event.videos.length) {
+          failPipelineJob(
+            job,
+            rejectionReason || 'Nessun candidato contiene clip animate pulite sufficienti.',
+            'frame_analysis',
+          );
+          return;
+        }
 
-      const inputPath = await findDownloadedVideo(video.id, video.file);
-      job.videoId = video.id;
-      job.video = {
-        id: video.id,
-        title: video.title,
-        url: video.url,
-        license: video.license ?? 'None',
+        const video = event.videos[candidateIndex++];
+        if (
+          !video ||
+          typeof video.id !== 'string' ||
+          !/^[A-Za-z0-9_-]{6,32}$/.test(video.id) ||
+          typeof video.title !== 'string' ||
+          typeof video.url !== 'string'
+          // typeof video.license !== 'string' ||
+          // !video.license
+          //   .toLowerCase()
+          //   .startsWith('creative commons attribution license')
+        ) {
+          throw new Error('Il downloader non ha restituito un risultato valido.');
+        }
+
+        const inputPath = await findDownloadedVideo(video.id, video.file);
+        job.videoId = video.id;
+        job.video = {
+          id: video.id,
+          title: video.title,
+          url: video.url,
+          license: video.license ?? 'None',
+        };
+        job.sourcePath = inputPath;
+        startVideoProcessing(
+          job,
+          video.id,
+          inputPath,
+          brief,
+          language,
+          tryNextCandidate,
+        );
       };
-      job.sourcePath = inputPath;
-      startVideoProcessing(job, video.id, inputPath, brief, language);
+
+      await tryNextCandidate('');
     },
   );
 }
